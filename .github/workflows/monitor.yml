@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       test_notify:
-        description: "Invia un WhatsApp di test"
+        description: "Invia un WhatsApp"
         type: boolean
         default: false
 
