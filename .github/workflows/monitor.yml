@@ -37,7 +37,7 @@ jobs:
         env:
           CALLMEBOT_PHONE: '+393396992631'
           CALLMEBOT_APIKEY: '8570211'
-          TARGET_DATE: '2026-10-25'
+          TARGET_DATE: '2026-10-27'
           FROM_STATION: ${{ vars.FROM_STATION || 'Nanu Oya' }}
           TO_STATION: ${{ vars.TO_STATION || 'Ella' }}
           TEST_FLAG: ${{ inputs.test_notify && '--test-notify' || '' }}
