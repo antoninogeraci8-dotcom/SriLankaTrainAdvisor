@@ -23,13 +23,24 @@ import time
 import urllib.parse
 import urllib.request
 
-from playwright.sync_api import sync_playwright
 
 URL = "https://seatreservation.railway.gov.lk/mtktwebslr/"
 MAX_NOTIFICHE = 3
 
+# ---- Pianificazione (ora dello Sri Lanka, UTC+5:30, niente ora legale) ----
+SL_TZ = dt.timezone(dt.timedelta(hours=5, minutes=30))
+OPEN_DAYS_BEFORE = 30  # la data D si sblocca il giorno D-30
+# Giorno di apertura: controllo a ogni run (ogni 10 min) in queste finestre...
+OPENING_WINDOWS = [((6, 40), (8, 0)),    # ipotesi 07:00
+                   ((9, 40), (11, 30))]  # ipotesi 10:00 (la più citata)
+# ...e fuori dalle finestre una volta l'ora, per non perdere un orario inatteso
+# Tutti gli altri giorni: un controllo al giorno, al primo run dopo quest'ora
+DAILY_AT = (10, 15)
+
 STATE_DIR = pathlib.Path("state")
 HEARTBEAT = STATE_DIR / "last_check.txt"
+LAST_DAILY = STATE_DIR / "last_daily.txt"    # data SL dell'ultimo controllo giornaliero
+LAST_HOURLY = STATE_DIR / "last_hourly.txt"  # ora SL dell'ultimo controllo orario (giorno di apertura)
 DEBUG_DIR = pathlib.Path("debug")
 
 MONTHS = ["January", "February", "March", "April", "May", "June", "July",
@@ -232,6 +243,8 @@ def is_available(target: dt.date, from_st: str, to_st: str, headed: bool = False
     for f in DEBUG_DIR.glob("*.png"):
         f.unlink()
 
+    from playwright.sync_api import sync_playwright
+
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=not headed, slow_mo=150 if headed else 0)
         page = browser.new_page(viewport={"width": 1400, "height": 1000}, locale="en-US")
@@ -287,6 +300,37 @@ def is_available(target: dt.date, from_st: str, to_st: str, headed: bool = False
             browser.close()
 
 
+def read(path: pathlib.Path) -> str:
+    return path.read_text().strip() if path.exists() else ""
+
+
+def counter_path(target: dt.date) -> pathlib.Path:
+    return STATE_DIR / f"notified_{target.isoformat()}.txt"
+
+
+def should_run(target: dt.date, now: dt.datetime) -> tuple[bool, str]:
+    today, hm = now.date(), (now.hour, now.minute)
+    count = int(read(counter_path(target)) or 0)
+    open_day = target - dt.timedelta(days=OPEN_DAYS_BEFORE)
+
+    if count >= MAX_NOTIFICHE:
+        return False, "già notificato 3 volte"
+    if count > 0:
+        return True, f"avvisi in corso ({count}/{MAX_NOTIFICHE})"
+    if today > target:
+        return False, "data già passata"
+    if today == open_day:
+        for a, b in OPENING_WINDOWS:
+            if a <= hm < b:
+                return True, f"giorno di apertura, finestra {a[0]:02d}:{a[1]:02d}-{b[0]:02d}:{b[1]:02d}"
+        if read(LAST_HOURLY) != now.strftime("%Y-%m-%dT%H"):
+            return True, "giorno di apertura, controllo orario"
+        return False, "giorno di apertura, fuori finestra (controllo orario già fatto)"
+    if hm >= DAILY_AT and read(LAST_DAILY) != today.isoformat():
+        return True, "controllo giornaliero"
+    return False, f"giorno normale, controllo giornaliero {'già fatto' if read(LAST_DAILY) == today.isoformat() else 'non ancora dovuto'}"
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Controlla se una data è prenotabile su Sri Lanka Railways")
     ap.add_argument("date", type=parse_date, help="es. 2026-12-28 oppure 28/12/2026")
@@ -295,9 +339,23 @@ def main() -> None:
     ap.add_argument("--headed", action="store_true", help="mostra il browser (al rallentatore)")
     ap.add_argument("--notify", action="store_true", help="manda WhatsApp se SÌ (modalità cloud)")
     ap.add_argument("--test-notify", action="store_true", help="manda un WhatsApp di prova")
+    ap.add_argument("--should-run", action="store_true", help="dice solo se in questo momento va fatto il controllo")
+    ap.add_argument("--force", action="store_true", help="con --should-run: rispondi sempre sì")
     a = ap.parse_args()
 
     label = f"{a.date:%d/%m/%Y} {a.from_st} → {a.to_st}"
+    now = dt.datetime.now(SL_TZ)
+
+    if a.should_run:
+        open_day = a.date - dt.timedelta(days=OPEN_DAYS_BEFORE)
+        run, why = (True, "run manuale") if a.force else should_run(a.date, now)
+        log(f"Ora Sri Lanka: {now:%d/%m %H:%M} | {label} | apertura prevista: {open_day:%d/%m}")
+        log(f"Decisione: {'CONTROLLO' if run else 'SALTO'} ({why})")
+        if os.environ.get("GITHUB_OUTPUT"):
+            with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                f.write(f"run={'true' if run else 'false'}\n")
+        return
+
     log(f"Controllo {label}")
 
     if a.test_notify:
@@ -308,10 +366,15 @@ def main() -> None:
         print(f"\n{label}: {'SÌ' if ok else 'NO'}")
         return
 
+    # --- modalità cloud ---
     STATE_DIR.mkdir(exist_ok=True)
     HEARTBEAT.write_text(dt.date.today().isoformat() + "\n")
-    counter = STATE_DIR / f"notified_{a.date.isoformat()}.txt"
-    count = int(counter.read_text()) if counter.exists() else 0
+    LAST_HOURLY.write_text(now.strftime("%Y-%m-%dT%H") + "\n")
+    if (now.hour, now.minute) >= DAILY_AT:
+        LAST_DAILY.write_text(now.date().isoformat() + "\n")
+
+    counter = counter_path(a.date)
+    count = int(read(counter) or 0)
     if count >= MAX_NOTIFICHE:
         log("Già notificato, niente da fare")
         return
@@ -319,6 +382,9 @@ def main() -> None:
     ok = is_available(a.date, a.from_st, a.to_st)
     print(f"\n{label}: {'SÌ' if ok else 'NO'}")
     if ok:
+        opened = STATE_DIR / f"opened_{a.date.isoformat()}.txt"
+        if not opened.exists():  # primo SÌ: registra quando l'hai visto aperto
+            opened.write_text(f"{now:%Y-%m-%d %H:%M} ora Sri Lanka\n")
         notify(f"🚂 {label}: data PRENOTABILE! Vai subito: {URL}")
         counter.write_text(str(count + 1))
 

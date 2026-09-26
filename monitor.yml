@@ -2,7 +2,7 @@ name: Monitor treno Sri Lanka
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "*/10 * * * *"   # "sveglia" ogni 10 min: è lo script a decidere se controllare davvero
   workflow_dispatch:
     inputs:
       test_notify:
@@ -21,6 +21,10 @@ jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      TARGET_DATE: ${{ vars.TARGET_DATE }}
+      FROM_STATION: ${{ vars.FROM_STATION || 'Nanu Oya' }}
+      TO_STATION: ${{ vars.TO_STATION || 'Ella' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -28,31 +32,35 @@ jobs:
         with:
           python-version: "3.12"
 
+      # Pochi secondi: decide se in questo momento va fatto il controllo
+      - name: Decidi se controllare
+        id: gate
+        run: python monitor.py "$TARGET_DATE" --should-run ${{ github.event_name == 'workflow_dispatch' && '--force' || '' }}
+
       - name: Installa Playwright
+        if: steps.gate.outputs.run == 'true'
         run: |
           pip install playwright
           python -m playwright install --with-deps chromium
 
       - name: Controlla il calendario
+        if: steps.gate.outputs.run == 'true'
         env:
           CALLMEBOT_PHONE: ${{ secrets.CALLMEBOT_PHONE }}
           CALLMEBOT_APIKEY: ${{ secrets.CALLMEBOT_APIKEY }}
-          TARGET_DATE: ${{ vars.TARGET_DATE }}
-          FROM_STATION: ${{ vars.FROM_STATION || 'Nanu Oya' }}
-          TO_STATION: ${{ vars.TO_STATION || 'Ella' }}
           TEST_FLAG: ${{ inputs.test_notify && '--test-notify' || '' }}
         run: python monitor.py "$TARGET_DATE" --from "$FROM_STATION" --to "$TO_STATION" --notify $TEST_FLAG
 
       - name: Salva stato
-        if: always()
+        if: always() && steps.gate.outputs.run == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add state || true
-          git diff --cached --quiet || (git commit -m "Aggiorna stato monitor" && git push)
+          git diff --cached --quiet || (git commit -m "Aggiorna stato monitor" && git pull --rebase && git push)
 
       - name: Screenshot di debug
-        if: always()
+        if: always() && steps.gate.outputs.run == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: debug
