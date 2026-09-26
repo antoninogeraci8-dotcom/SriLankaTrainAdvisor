@@ -235,7 +235,7 @@ def click_next(page, st: Stepper, header: str) -> bool:
 
 
 def is_available(target: dt.date, from_st: str, to_st: str, headed: bool = False) -> bool:
-    if target < dt.date.today():
+    if target < dt.datetime.now(SL_TZ).date():
         log("Data nel passato")
         return False
     target_ym = (target.year, target.month)
@@ -247,7 +247,8 @@ def is_available(target: dt.date, from_st: str, to_st: str, headed: bool = False
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=not headed, slow_mo=150 if headed else 0)
-        page = browser.new_page(viewport={"width": 1400, "height": 1000}, locale="en-US")
+        page = browser.new_page(viewport={"width": 1400, "height": 1000}, locale="en-US",
+                                timezone_id="Asia/Colombo")  # il browser "vive" in Sri Lanka, ovunque giri
         page.on("console", lambda m: m.type == "error" and log(f"  [console error] {m.text[:150]}"))
         st = Stepper(page)
         try:
@@ -368,7 +369,7 @@ def main() -> None:
 
     # --- modalità cloud ---
     STATE_DIR.mkdir(exist_ok=True)
-    HEARTBEAT.write_text(dt.date.today().isoformat() + "\n")
+    HEARTBEAT.write_text(now.date().isoformat() + "\n")
     LAST_HOURLY.write_text(now.strftime("%Y-%m-%dT%H") + "\n")
     if (now.hour, now.minute) >= DAILY_AT:
         LAST_DAILY.write_text(now.date().isoformat() + "\n")
