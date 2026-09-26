@@ -35,9 +35,9 @@ jobs:
 
       - name: Controlla il calendario
         env:
-          CALLMEBOT_PHONE: ${{ secrets.CALLMEBOT_PHONE }}
-          CALLMEBOT_APIKEY: ${{ secrets.CALLMEBOT_APIKEY }}
-          TARGET_DATE: ${{ vars.TARGET_DATE }}
+          CALLMEBOT_PHONE: '+393396992631'
+          CALLMEBOT_APIKEY: 8570211
+          TARGET_DATE: '2026-10-25'
           FROM_STATION: ${{ vars.FROM_STATION || 'Nanu Oya' }}
           TO_STATION: ${{ vars.TO_STATION || 'Ella' }}
           TEST_FLAG: ${{ inputs.test_notify && '--test-notify' || '' }}
