@@ -2,7 +2,9 @@ name: Monitor treno Sri Lanka
 
 on:
   schedule:
-    - cron: "*/10 * * * *"   # "sveglia" ogni 10 min: è lo script a decidere se controllare davvero
+    # ogni 10 min tra le 17 e le 22:50 UTC = copre 19-24 italiane sia in ora legale che solare;
+    # la finestra precisa la decide lo script con CHECK_WINDOW_IT
+    - cron: "*/10 17-22 * * *"
   workflow_dispatch:
     inputs:
       test_notify:
@@ -22,7 +24,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      TARGET_DATE: '2026-10-28'
+      TARGET_DATE: "auto"            # auto = domani + 30 giorni (ora italiana); oppure una data fissa AAAA-MM-GG
+      CHECK_WINDOW_IT: "19:00-24:00" # controlla a ogni run in questa fascia (ora italiana); vuoto = pianificazione automatica
       FROM_STATION: ${{ vars.FROM_STATION || 'Nanu Oya' }}
       TO_STATION: ${{ vars.TO_STATION || 'Ella' }}
     steps:
@@ -46,8 +49,8 @@ jobs:
       - name: Controlla il calendario
         if: steps.gate.outputs.run == 'true'
         env:
-          CALLMEBOT_PHONE: '+393396992631'
-          CALLMEBOT_APIKEY: '8570211'
+          CALLMEBOT_PHONE: ${{ secrets.CALLMEBOT_PHONE }}
+          CALLMEBOT_APIKEY: ${{ secrets.CALLMEBOT_APIKEY }}
           TEST_FLAG: ${{ inputs.test_notify && '--test-notify' || '' }}
         run: python monitor.py "$TARGET_DATE" --from "$FROM_STATION" --to "$TO_STATION" --notify $TEST_FLAG
 
