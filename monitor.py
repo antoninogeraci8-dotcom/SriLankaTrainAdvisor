@@ -22,6 +22,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+from zoneinfo import ZoneInfo
 
 
 URL = "https://seatreservation.railway.gov.lk/mtktwebslr/"
@@ -29,6 +30,8 @@ MAX_NOTIFICHE = 3
 
 # ---- Pianificazione (ora dello Sri Lanka, UTC+5:30, niente ora legale) ----
 SL_TZ = dt.timezone(dt.timedelta(hours=5, minutes=30))
+IT_TZ = ZoneInfo("Europe/Rome")
+FAILS_KEEP = 10  # quanti check NO tenere in memoria per data
 OPEN_DAYS_BEFORE = 30  # la data D si sblocca il giorno D-30
 # Giorno di apertura: controllo a ogni run (ogni 10 min) in queste finestre...
 OPENING_WINDOWS = [((6, 40), (8, 0)),    # ipotesi 07:00
@@ -128,7 +131,14 @@ DAY_JS = "(day) => {" + JS_LIB + r"""
 
 
 # ---------- utilità ----------
+def auto_target(now_it: dt.datetime) -> dt.date:
+    """Domani (ora italiana) + 30 giorni. Es. 26/09 -> 27/10."""
+    return now_it.date() + dt.timedelta(days=1 + OPEN_DAYS_BEFORE)
+
+
 def parse_date(s: str) -> dt.date:
+    if s.strip().lower() in ("auto", "domani+30"):
+        return auto_target(dt.datetime.now(IT_TZ))
     for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
         try:
             return dt.datetime.strptime(s.strip(), fmt).date()
@@ -309,21 +319,48 @@ def counter_path(target: dt.date) -> pathlib.Path:
     return STATE_DIR / f"notified_{target.isoformat()}.txt"
 
 
-def should_run(target: dt.date, now: dt.datetime) -> tuple[bool, str]:
-    today, hm = now.date(), (now.hour, now.minute)
-    count = int(read(counter_path(target)) or 0)
-    open_day = target - dt.timedelta(days=OPEN_DAYS_BEFORE)
+def fails_path(target: dt.date) -> pathlib.Path:
+    return STATE_DIR / f"fails_{target.isoformat()}.txt"
 
+
+def fmt_times(now: dt.datetime) -> str:
+    """Es. '20:31 IT (00:01 SL)'"""
+    return f"{now.astimezone(IT_TZ):%H:%M} IT ({now.astimezone(SL_TZ):%H:%M} SL)"
+
+
+def parse_window(w: str) -> tuple[int, int]:
+    """'19:00-24:00' -> minuti dall'inizio del giorno (inizio, fine)."""
+    a, b = w.strip().split("-")
+    to_min = lambda x: int(x.split(":")[0]) * 60 + int(x.split(":")[1])
+    return to_min(a), to_min(b)
+
+
+def should_run(target: dt.date, now: dt.datetime) -> tuple[bool, str]:
+    count = int(read(counter_path(target)) or 0)
     if count >= MAX_NOTIFICHE:
         return False, "già notificato 3 volte"
     if count > 0:
         return True, f"avvisi in corso ({count}/{MAX_NOTIFICHE})"
+
+    # Finestra fissa in ora italiana (es. CHECK_WINDOW_IT="19:00-24:00"): ogni run dentro, niente fuori
+    window = os.environ.get("CHECK_WINDOW_IT", "").strip()
+    if window:
+        start, end = parse_window(window)
+        it = now.astimezone(IT_TZ)
+        m = it.hour * 60 + it.minute
+        inside = start <= m < end
+        return inside, f"finestra IT {window}: ora {it:%H:%M} {'dentro' if inside else 'fuori'}"
+
+    # Pianificazione automatica (ora Sri Lanka)
+    now = now.astimezone(SL_TZ)
+    today, hm = now.date(), (now.hour, now.minute)
+    open_day = target - dt.timedelta(days=OPEN_DAYS_BEFORE)
     if today > target:
         return False, "data già passata"
     if today == open_day:
         for a, b in OPENING_WINDOWS:
             if a <= hm < b:
-                return True, f"giorno di apertura, finestra {a[0]:02d}:{a[1]:02d}-{b[0]:02d}:{b[1]:02d}"
+                return True, f"giorno di apertura, finestra {a[0]:02d}:{a[1]:02d}-{b[0]:02d}:{b[1]:02d} SL"
         if read(LAST_HOURLY) != now.strftime("%Y-%m-%dT%H"):
             return True, "giorno di apertura, controllo orario"
         return False, "giorno di apertura, fuori finestra (controllo orario già fatto)"
@@ -334,7 +371,7 @@ def should_run(target: dt.date, now: dt.datetime) -> tuple[bool, str]:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Controlla se una data è prenotabile su Sri Lanka Railways")
-    ap.add_argument("date", type=parse_date, help="es. 2026-12-28 oppure 28/12/2026")
+    ap.add_argument("date", type=parse_date, help="es. 2026-12-28, 28/12/2026 oppure auto (= domani + 30 giorni)")
     ap.add_argument("--from", dest="from_st", default="Nanu Oya")
     ap.add_argument("--to", dest="to_st", default="Ella")
     ap.add_argument("--headed", action="store_true", help="mostra il browser (al rallentatore)")
@@ -350,14 +387,14 @@ def main() -> None:
     if a.should_run:
         open_day = a.date - dt.timedelta(days=OPEN_DAYS_BEFORE)
         run, why = (True, "run manuale") if a.force else should_run(a.date, now)
-        log(f"Ora Sri Lanka: {now:%d/%m %H:%M} | {label} | apertura prevista: {open_day:%d/%m}")
+        log(f"Ora: {fmt_times(now)} | {label} | apertura prevista: {open_day:%d/%m}")
         log(f"Decisione: {'CONTROLLO' if run else 'SALTO'} ({why})")
         if os.environ.get("GITHUB_OUTPUT"):
             with open(os.environ["GITHUB_OUTPUT"], "a") as f:
                 f.write(f"run={'true' if run else 'false'}\n")
         return
 
-    log(f"Controllo {label}")
+    log(f"Controllo {label} alle {fmt_times(now)}")
 
     if a.test_notify:
         notify(f"✅ Test: monitor attivo per {label}")
@@ -382,12 +419,25 @@ def main() -> None:
 
     ok = is_available(a.date, a.from_st, a.to_st)
     print(f"\n{label}: {'SÌ' if ok else 'NO'}")
-    if ok:
-        opened = STATE_DIR / f"opened_{a.date.isoformat()}.txt"
-        if not opened.exists():  # primo SÌ: registra quando l'hai visto aperto
-            opened.write_text(f"{now:%Y-%m-%d %H:%M} ora Sri Lanka\n")
-        notify(f"🚂 {label}: data PRENOTABILE! Vai subito: {URL}")
-        counter.write_text(str(count + 1))
+    fails = fails_path(a.date)
+    past = [l for l in read(fails).splitlines() if l]
+
+    if not ok:
+        past.append(fmt_times(now))
+        fails.write_text("\n".join(past[-FAILS_KEEP:]) + "\n")
+        return
+
+    opened = STATE_DIR / f"opened_{a.date.isoformat()}.txt"
+    if not opened.exists():  # primo SÌ: registra quando l'hai visto aperto
+        opened.write_text(fmt_times(now) + "\n")
+    last3 = ", ".join(reversed(past[-3:])) or "nessuno registrato"
+    notify(
+        f"🚂 {label}: PRENOTABILE!\n"
+        f"Check OK alle {fmt_times(now)}\n"
+        f"Ultimi check NO: {last3}\n"
+        f"{URL}"
+    )
+    counter.write_text(str(count + 1))
 
 
 if __name__ == "__main__":
