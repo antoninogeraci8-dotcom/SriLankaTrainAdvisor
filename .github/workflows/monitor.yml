@@ -4,7 +4,7 @@ on:
   schedule:
     # ogni 10 min tra le 17 e le 22:50 UTC = copre 19-24 italiane sia in ora legale che solare;
     # la finestra precisa la decide lo script con CHECK_WINDOW_IT
-    - cron: "*/10 17-22 * * *"
+    - cron: "*/10 16-23 * * *"
   workflow_dispatch:
     inputs:
       test_notify:
