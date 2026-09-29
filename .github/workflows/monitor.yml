@@ -26,7 +26,7 @@ jobs:
     env:
       TARGET_DATE: "auto"            # auto = domani + 30 giorni (ora italiana); oppure una data fissa AAAA-MM-GG
       CHECK_WINDOW_IT: "18:00-24:00" # controlla a ogni run in questa fascia (ora italiana); vuoto = pianificazione automatica
-      SEATS_ON_NO: "sempre"   # sera | sempre | mai
+      SEATS_ON_NO: "sera"   # sera | sempre | mai
       FROM_STATION: ${{ vars.FROM_STATION || 'Nanu Oya' }}
       TO_STATION: ${{ vars.TO_STATION || 'Ella' }}
     steps:
