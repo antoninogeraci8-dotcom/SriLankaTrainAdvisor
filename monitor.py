@@ -571,6 +571,14 @@ def main() -> None:
     if not ok:
         past.append(fmt_times(now))
         fails.write_text("\n".join(past[-FAILS_KEEP:]) + "\n")
+        # Una volta a sera (per data cercata): riepilogo posti anche se la data è ancora chiusa
+        seats_sent = STATE_DIR / f"seats_sent_{a.date.isoformat()}.txt"
+        if a.seats and not seats_sent.exists():
+            report = seats_report(a.date, a.seats_days, a.from_st, a.to_st)
+            rep = format_report(report)
+            print("\n" + rep)
+            notify(f"📊 {label}: ancora chiusa (check {fmt_times(now)})\n\nPosti:\n{rep}")
+            seats_sent.write_text(fmt_times(now) + "\n")
         return
 
     opened = STATE_DIR / f"opened_{a.date.isoformat()}.txt"
