@@ -1,16 +1,18 @@
 """
 Controlla se una data è selezionabile nel calendario di
-seatreservation.railway.gov.lk (default: Nanu Oya -> Ella).
+seatreservation.railway.gov.lk (default: Nanu Oya -> Ella) e, con --seats,
+esegue la ricerca vera per quella data e i 3 giorni precedenti leggendo i posti per classe.
 
-Uso locale (stampa SÌ/NO + log dei passaggi):
-    python monitor.py 2026-12-28
-    python monitor.py 25/10/2026 --headed        # vedi il browser mentre lavora
-    python monitor.py 2026-12-28 --from "Kandy" --to "Ella"
+Uso locale:
+    python monitor.py 2026-12-28                 # SÌ/NO
+    python monitor.py 2026-10-30 --seats         # posti per classe: 30/10, 29/10, 28/10, 27/10
+    python monitor.py 2026-10-30 --seats --headed
+    python monitor.py auto --seats --seats-days 1
 
-Uso cloud (manda WhatsApp via CallMeBot se è SÌ):
-    python monitor.py 2026-12-28 --notify
+Uso cloud (WhatsApp via CallMeBot se è SÌ, con i posti se c'è --seats):
+    python monitor.py auto --notify --seats
 
-Debug: in debug/ trovi uno screenshot per ogni passaggio e l'HTML del calendario.
+Debug: in debug/ trovi screenshot per ogni passaggio, l'HTML del calendario e dei risultati.
 """
 from __future__ import annotations
 
@@ -24,26 +26,22 @@ import urllib.parse
 import urllib.request
 from zoneinfo import ZoneInfo
 
-
 URL = "https://seatreservation.railway.gov.lk/mtktwebslr/"
 MAX_NOTIFICHE = 3
+MAX_MSG_CHARS = 1800  # CallMeBot passa il testo in URL: teniamolo compatto
 
 # ---- Pianificazione (ora dello Sri Lanka, UTC+5:30, niente ora legale) ----
 SL_TZ = dt.timezone(dt.timedelta(hours=5, minutes=30))
 IT_TZ = ZoneInfo("Europe/Rome")
-FAILS_KEEP = 10  # quanti check NO tenere in memoria per data
+FAILS_KEEP = 10
 OPEN_DAYS_BEFORE = 30  # la data D si sblocca il giorno D-30
-# Giorno di apertura: controllo a ogni run (ogni 10 min) in queste finestre...
-OPENING_WINDOWS = [((6, 40), (8, 0)),    # ipotesi 07:00
-                   ((9, 40), (11, 30))]  # ipotesi 10:00 (la più citata)
-# ...e fuori dalle finestre una volta l'ora, per non perdere un orario inatteso
-# Tutti gli altri giorni: un controllo al giorno, al primo run dopo quest'ora
+OPENING_WINDOWS = [((6, 40), (8, 0)), ((9, 40), (11, 30))]  # solo pianificazione automatica
 DAILY_AT = (10, 15)
 
 STATE_DIR = pathlib.Path("state")
 HEARTBEAT = STATE_DIR / "last_check.txt"
-LAST_DAILY = STATE_DIR / "last_daily.txt"    # data SL dell'ultimo controllo giornaliero
-LAST_HOURLY = STATE_DIR / "last_hourly.txt"  # ora SL dell'ultimo controllo orario (giorno di apertura)
+LAST_DAILY = STATE_DIR / "last_daily.txt"
+LAST_HOURLY = STATE_DIR / "last_hourly.txt"
 DEBUG_DIR = pathlib.Path("debug")
 
 MONTHS = ["January", "February", "March", "April", "May", "June", "July",
@@ -87,7 +85,6 @@ BOX_INFO_JS = "() => {" + JS_LIB + r"""
   return {tag: box.tagName, cls: cls(box), id: box.id, html: box.outerHTML};
 }"""
 
-# Marca con data-mon-next i possibili pulsanti "mese successivo" dentro il calendario
 NEXT_CANDIDATES_JS = "() => {" + JS_LIB + r"""
   document.querySelectorAll('[data-mon-next]').forEach(e => e.removeAttribute('data-mon-next'));
   const h = findHeaders()[0];
@@ -111,7 +108,9 @@ NEXT_CANDIDATES_JS = "() => {" + JS_LIB + r"""
   return out;
 }"""
 
+# Trova la cella del giorno, la marca con data-mon-day (per poterla cliccare) e dice se è attiva
 DAY_JS = "(day) => {" + JS_LIB + r"""
+  document.querySelectorAll('[data-mon-day]').forEach(e => e.removeAttribute('data-mon-day'));
   const h = findHeaders()[0];
   if (!h) return {found: false, reason: 'intestazione calendario non trovata'};
   const box = findBox(h);
@@ -124,17 +123,32 @@ DAY_JS = "(day) => {" + JS_LIB + r"""
     const classes = chain.map(cls).join(' | ');
     if (chain.some(e => outside.test(cls(e)))) { seen.push('SCARTATA (altro mese): ' + classes); continue; }
     const isDis = chain.some(e => disabled.test(cls(e)) || e.getAttribute('aria-disabled') === 'true' || e.hasAttribute('disabled'));
+    c.setAttribute('data-mon-day', '1');
     return {found: true, enabled: !isDis, classes, html: c.outerHTML.slice(0, 200), seen};
   }
   return {found: false, reason: 'giorno non trovato', seen};
 }"""
 
+# Estrae in modo generico il contenuto della pagina: tabelle visibili + righe di testo "rilevanti"
+PAGE_TEXT_JS = r"""
+() => {
+  const norm = s => (s || '').replace(/[ \t\u00a0]+/g, ' ').trim();
+  const vis = el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+  const tables = [...document.querySelectorAll('table')].filter(vis).map(t =>
+    [...t.rows].map(r => [...r.cells].map(c => norm(c.innerText)).join(' | ')).filter(x => x.replace(/[| ]/g, ''))
+  ).filter(t => t.length);
+  const lines = (document.body.innerText || '').split('\n').map(norm).filter(l => l && l.length <= 200);
+  return {url: location.href, title: document.title, tables, lines};
+}
+"""
+# Righe utili nei risultati: classi, posti, orari, treni, messaggi di errore
+RELEVANT = r"(class|saloon|observation|seat|available|berth|sleeper|reserved|train|\b\d{1,2}[:.]\d{2}\b|no\s+(result|train|seat)|sold|full|not\s+available|error|login)"
+
 
 # ---------- utilità ----------
 def auto_target(now: dt.datetime) -> dt.date:
-    """La prossima data che si sblocca (o quella appena sbloccata) alla mezzanotte SL.
-    Cambia a mezzogiorno SL (8:30 IT legale / 7:30 IT solare), così resta la stessa
-    per tutta la sera, anche a cavallo della mezzanotte italiana.
+    """Prossima data che si sblocca (o appena sbloccata) alla mezzanotte SL.
+    Cambia a mezzogiorno SL (8:30 IT legale / 7:30 IT solare): resta la stessa per tutta la sera.
     Es. 26/09 pomeriggio o sera -> 27/10."""
     base = (now.astimezone(SL_TZ) - dt.timedelta(hours=12)).date()
     return base + dt.timedelta(days=1 + OPEN_DAYS_BEFORE)
@@ -142,13 +156,13 @@ def auto_target(now: dt.datetime) -> dt.date:
 
 def parse_date(s: str) -> dt.date:
     if s.strip().lower() in ("auto", "domani+30"):
-        return auto_target(dt.datetime.now(IT_TZ))
+        return auto_target(dt.datetime.now(SL_TZ))
     for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
         try:
             return dt.datetime.strptime(s.strip(), fmt).date()
         except ValueError:
             pass
-    raise argparse.ArgumentTypeError(f"Data non valida: {s} (usa 2026-12-28 o 28/12/2026)")
+    raise argparse.ArgumentTypeError(f"Data non valida: {s} (usa 2026-12-28, 28/12/2026 o auto)")
 
 
 def header_to_ym(h: str) -> tuple[int, int]:
@@ -157,6 +171,8 @@ def header_to_ym(h: str) -> tuple[int, int]:
 
 
 def notify(text: str) -> None:
+    if len(text) > MAX_MSG_CHARS:
+        text = text[:MAX_MSG_CHARS - 20] + "\n…(troncato)"
     q = urllib.parse.urlencode({
         "phone": os.environ["CALLMEBOT_PHONE"],
         "apikey": os.environ["CALLMEBOT_APIKEY"],
@@ -166,19 +182,40 @@ def notify(text: str) -> None:
         log(f"CallMeBot: HTTP {r.status}")
 
 
+def reset_debug() -> None:
+    DEBUG_DIR.mkdir(exist_ok=True)
+    for f in list(DEBUG_DIR.glob("*.png")) + list(DEBUG_DIR.glob("results_*.html")):
+        f.unlink()
+
+
 class Stepper:
-    """Salva uno screenshot numerato per ogni passaggio."""
-    def __init__(self, page):
-        self.page, self.n = page, 0
+    """Salva uno screenshot numerato per ogni passaggio (numerazione unica per tutto il run)."""
+    n = 0
+
+    def __init__(self, page, prefix: str = ""):
+        self.page, self.prefix = page, prefix
 
     def shot(self, name: str) -> None:
-        self.n += 1
-        path = DEBUG_DIR / f"{self.n:02d}_{name}.png"
+        Stepper.n += 1
+        path = DEBUG_DIR / f"{Stepper.n:02d}_{self.prefix}{name}.png"
         try:
-            self.page.screenshot(path=str(path))
+            self.page.screenshot(path=str(path), full_page=True)
             log(f"  screenshot → {path}")
         except Exception as e:
             log(f"  screenshot fallito: {e}")
+
+
+# ---------- navigazione ----------
+def new_page(browser):
+    page = browser.new_page(viewport={"width": 1400, "height": 1000}, locale="en-US",
+                            timezone_id="Asia/Colombo")  # il browser "vive" in Sri Lanka, ovunque giri
+    page.on("console", lambda m: m.type == "error" and log(f"  [console error] {m.text[:150]}"))
+
+    def on_dialog(d):
+        log(f"  [popup del sito] {d.message}")
+        d.accept()
+    page.on("dialog", on_dialog)
+    return page
 
 
 def current_header(page) -> str | None:
@@ -196,6 +233,21 @@ def select_station(page, idx: int, name: str) -> None:
         log(f"  ✓ selezionata '{name}'")
     except Exception as e:
         log(f"  ✗ non riesco a selezionarla ({e.__class__.__name__}), proseguo")
+
+
+def fill_passengers(page, n: int = 1) -> None:
+    loc = page.locator("input[placeholder*='Passenger' i], select[name*='passenger' i], input[name*='passenger' i]").first
+    if not loc.count():
+        log("Passeggeri: campo non trovato")
+        return
+    try:
+        if (loc.evaluate("e => e.tagName")).lower() == "select":
+            loc.select_option(str(n), timeout=3000)
+        else:
+            loc.fill(str(n), timeout=3000)
+        log(f"Passeggeri: impostato {n}")
+    except Exception as e:
+        log(f"Passeggeri: non riesco a impostarlo ({e.__class__.__name__})")
 
 
 def open_calendar(page, st: Stepper) -> None:
@@ -229,7 +281,6 @@ def click_next(page, st: Stepper, header: str) -> bool:
     log(f"  candidati 'mese successivo' nel calendario: {len(cands)}")
     for c in cands:
         log(f"    [{c['idx']}] <{c['tag']}> class='{c['cls']}' text='{c['text']}' disabled={c['disabled']}")
-        log(f"        {c['html']}")
     for c in cands:
         if c["disabled"]:
             continue
@@ -248,65 +299,68 @@ def click_next(page, st: Stepper, header: str) -> bool:
     return False
 
 
+def prepare(page, st: Stepper, from_st: str, to_st: str) -> None:
+    log(f"Apro {URL}")
+    page.goto(URL, wait_until="networkidle", timeout=90000)
+    log(f"  pagina caricata: '{page.title()}'")
+    st.shot("pagina")
+    select_station(page, 0, from_st)
+    select_station(page, 1, to_st)
+    fill_passengers(page, 1)
+    st.shot("stazioni")
+    open_calendar(page, st)
+    box = page.evaluate(BOX_INFO_JS)
+    if box:
+        (DEBUG_DIR / "calendar.html").write_text(box["html"], encoding="utf-8")
+        log(f"Riquadro calendario: <{box['tag']}> id='{box['id']}' class='{box['cls']}'")
+
+
+def goto_month(page, st: Stepper, target: dt.date) -> bool:
+    target_ym = (target.year, target.month)
+    for step in range(24):
+        header = current_header(page)
+        ym = header_to_ym(header)
+        log(f"Passo {step}: calendario su {header}, cerco {MONTHS[target.month - 1]} {target.year}")
+        if ym == target_ym:
+            log("  ✓ mese giusto raggiunto")
+            return True
+        if ym > target_ym:
+            raise RuntimeError(f"Il calendario è su {header}, oltre la data cercata")
+        if not click_next(page, st, header):
+            log(f"  ✗ non riesco ad andare oltre {header}")
+            st.shot("bloccato")
+            return False
+    raise RuntimeError("Non riesco ad arrivare al mese cercato")
+
+
+def check_day(page, target: dt.date) -> dict:
+    res = page.evaluate(DAY_JS, target.day)
+    for s in res.get("seen", []):
+        log(f"  {s}")
+    if not res["found"]:
+        raise RuntimeError(res["reason"])
+    log(f"Giorno {target.day}: classi = {res['classes']} → {'ATTIVO' if res['enabled'] else 'DISABILITATO'}")
+    return res
+
+
+# ---------- 1) la data è selezionabile? ----------
 def is_available(target: dt.date, from_st: str, to_st: str, headed: bool = False) -> bool:
     if target < dt.datetime.now(SL_TZ).date():
         log("Data nel passato")
         return False
-    target_ym = (target.year, target.month)
-    DEBUG_DIR.mkdir(exist_ok=True)
-    for f in DEBUG_DIR.glob("*.png"):
-        f.unlink()
-
     from playwright.sync_api import sync_playwright
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=not headed, slow_mo=150 if headed else 0)
-        page = browser.new_page(viewport={"width": 1400, "height": 1000}, locale="en-US",
-                                timezone_id="Asia/Colombo")  # il browser "vive" in Sri Lanka, ovunque giri
-        page.on("console", lambda m: m.type == "error" and log(f"  [console error] {m.text[:150]}"))
-        st = Stepper(page)
+        page = new_page(browser)
+        st = Stepper(page, "disp_")
         try:
-            log(f"Apro {URL}")
-            page.goto(URL, wait_until="networkidle", timeout=90000)
-            log(f"  pagina caricata: '{page.title()}'")
-            st.shot("pagina")
-
-            select_station(page, 0, from_st)
-            select_station(page, 1, to_st)
-            st.shot("stazioni")
-
-            open_calendar(page, st)
-            box = page.evaluate(BOX_INFO_JS)
-            if box:
-                (DEBUG_DIR / "calendar.html").write_text(box["html"], encoding="utf-8")
-                log(f"Riquadro calendario: <{box['tag']}> id='{box['id']}' class='{box['cls']}' → debug/calendar.html")
-
-            for step in range(24):
-                header = current_header(page)
-                ym = header_to_ym(header)
-                log(f"Passo {step}: calendario su {header}, cerco {MONTHS[target.month - 1]} {target.year}")
-                if ym == target_ym:
-                    log("  ✓ mese giusto raggiunto")
-                    break
-                if ym > target_ym:
-                    raise RuntimeError(f"Il calendario è su {header}, oltre la data cercata")
-                if not click_next(page, st, header):
-                    log(f"  ✗ non riesco ad andare oltre {header}")
-                    st.shot("bloccato")
-                    return False
-            else:
-                raise RuntimeError("Non riesco ad arrivare al mese cercato")
-
-            res = page.evaluate(DAY_JS, target.day)
-            for s in res.get("seen", []):
-                log(f"  {s}")
-            if not res["found"]:
-                raise RuntimeError(res["reason"])
-            log(f"Giorno {target.day}: classi = {res['classes']}")
-            log(f"  {res['html']}")
-            log(f"  → {'ATTIVO' if res['enabled'] else 'DISABILITATO'}")
+            prepare(page, st, from_st, to_st)
+            if not goto_month(page, st, target):
+                return False
+            ok = check_day(page, target)["enabled"]
             st.shot("risultato")
-            return res["enabled"]
+            return ok
         finally:
             try:
                 (DEBUG_DIR / "page.html").write_text(page.content(), encoding="utf-8")
@@ -315,6 +369,91 @@ def is_available(target: dt.date, from_st: str, to_st: str, headed: bool = False
             browser.close()
 
 
+# ---------- 2) ricerca vera e posti per classe ----------
+def search_one(browser, target: dt.date, from_st: str, to_st: str) -> dict:
+    tag = f"{target:%m%d}_"
+    page = new_page(browser)
+    st = Stepper(page, tag)
+    log(f"=== Ricerca posti per {target:%d/%m/%Y} ===")
+    try:
+        prepare(page, st, from_st, to_st)
+        if not goto_month(page, st, target) or not check_day(page, target)["enabled"]:
+            return {"date": target, "status": "data non ancora aperta", "lines": []}
+
+        page.locator("[data-mon-day='1']").click(timeout=3000)
+        page.wait_for_timeout(500)
+        try:
+            val = page.locator("input[placeholder='Date']").first.input_value()
+        except Exception:
+            val = "?"
+        log(f"  data inserita nel campo: '{val}'")
+        st.shot("data_scelta")
+
+        before = set(page.evaluate(PAGE_TEXT_JS)["lines"])  # testo prima della ricerca (per scartare banner ecc.)
+
+        btn = page.get_by_role("button", name="Search")
+        if not btn.count():
+            btn = page.locator("button:has-text('Search'), input[value='Search']")
+        log(f"  click su Search ({btn.count()} pulsanti trovati)")
+        btn.first.click(timeout=5000)
+        try:
+            page.wait_for_load_state("networkidle", timeout=30000)
+        except Exception:
+            log("  (networkidle non raggiunto in 30s, proseguo)")
+        page.wait_for_timeout(2500)
+        st.shot("risultati")
+
+        html_path = DEBUG_DIR / f"results_{target.isoformat()}.html"
+        html_path.write_text(page.content(), encoding="utf-8")
+        data = page.evaluate(PAGE_TEXT_JS)
+        log(f"  URL risultati: {data['url']} | titolo: '{data['title']}' | HTML → {html_path}")
+
+        import re
+        rel = re.compile(RELEVANT, re.I)
+        new_lines = [l for l in data["lines"] if l not in before]
+        relevant = [l for l in new_lines if rel.search(l)]
+        log(f"  righe nuove dopo la ricerca: {len(new_lines)}, rilevanti: {len(relevant)}")
+        for l in relevant[:60]:
+            log(f"    | {l}")
+        for i, t in enumerate(data["tables"]):
+            log(f"  tabella {i} ({len(t)} righe):")
+            for r in t[:30]:
+                log(f"    # {r}")
+
+        # per il messaggio: righe di tabella se ci sono, altrimenti le righe rilevanti
+        table_rows = [r for t in data["tables"] for r in t if rel.search(r)]
+        lines = table_rows or relevant
+        status = "ok" if lines else "nessun risultato leggibile (vedi HTML)"
+        return {"date": target, "status": status, "lines": lines[:15]}
+    except Exception as e:
+        log(f"  ERRORE nella ricerca: {e}")
+        st.shot("errore")
+        return {"date": target, "status": f"errore: {str(e)[:80]}", "lines": []}
+    finally:
+        page.close()
+
+
+def seats_report(target: dt.date, days_before: int, from_st: str, to_st: str, headed: bool = False) -> list[dict]:
+    from playwright.sync_api import sync_playwright
+
+    dates = [target - dt.timedelta(days=i) for i in range(days_before + 1)]
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=not headed, slow_mo=150 if headed else 0)
+        try:
+            return [search_one(browser, d, from_st, to_st) for d in dates]
+        finally:
+            browser.close()
+
+
+def format_report(report: list[dict]) -> str:
+    out = []
+    for r in report:
+        out.append(f"📅 {r['date']:%a %d/%m}: {r['status'] if r['status'] != 'ok' else ''}".rstrip())
+        out += [f"  • {l}" for l in r["lines"]]
+    return "\n".join(out)
+
+
+# ---------- pianificazione ----------
 def read(path: pathlib.Path) -> str:
     return path.read_text().strip() if path.exists() else ""
 
@@ -328,7 +467,6 @@ def fails_path(target: dt.date) -> pathlib.Path:
 
 
 def fmt_times(now: dt.datetime) -> str:
-    """Es. '20:31 IT (00:01 SL)'"""
     return f"{now.astimezone(IT_TZ):%H:%M} IT ({now.astimezone(SL_TZ):%H:%M} SL)"
 
 
@@ -346,7 +484,6 @@ def should_run(target: dt.date, now: dt.datetime) -> tuple[bool, str]:
     if count > 0:
         return True, f"avvisi in corso ({count}/{MAX_NOTIFICHE})"
 
-    # Finestra fissa in ora italiana (es. CHECK_WINDOW_IT="19:00-24:00"): ogni run dentro, niente fuori
     window = os.environ.get("CHECK_WINDOW_IT", "").strip()
     if window:
         start, end = parse_window(window)
@@ -355,7 +492,6 @@ def should_run(target: dt.date, now: dt.datetime) -> tuple[bool, str]:
         inside = (start <= m < end) if start < end else (m >= start or m < end)  # anche a cavallo di mezzanotte
         return inside, f"finestra IT {window}: ora {it:%H:%M} {'dentro' if inside else 'fuori'}"
 
-    # Pianificazione automatica (ora Sri Lanka)
     now = now.astimezone(SL_TZ)
     today, hm = now.date(), (now.hour, now.minute)
     open_day = target - dt.timedelta(days=OPEN_DAYS_BEFORE)
@@ -375,10 +511,12 @@ def should_run(target: dt.date, now: dt.datetime) -> tuple[bool, str]:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Controlla se una data è prenotabile su Sri Lanka Railways")
-    ap.add_argument("date", type=parse_date, help="es. 2026-12-28, 28/12/2026 oppure auto (= domani + 30 giorni)")
+    ap.add_argument("date", type=parse_date, help="es. 2026-12-28, 28/12/2026 oppure auto (= prossima data che si sblocca)")
     ap.add_argument("--from", dest="from_st", default="Nanu Oya")
     ap.add_argument("--to", dest="to_st", default="Ella")
     ap.add_argument("--headed", action="store_true", help="mostra il browser (al rallentatore)")
+    ap.add_argument("--seats", action="store_true", help="fa la ricerca vera e legge i posti per classe")
+    ap.add_argument("--seats-days", type=int, default=3, help="quanti giorni precedenti cercare con --seats (default 3)")
     ap.add_argument("--notify", action="store_true", help="manda WhatsApp se SÌ (modalità cloud)")
     ap.add_argument("--test-notify", action="store_true", help="manda un WhatsApp di prova")
     ap.add_argument("--should-run", action="store_true", help="dice solo se in questo momento va fatto il controllo")
@@ -399,6 +537,7 @@ def main() -> None:
         return
 
     log(f"Controllo {label} alle {fmt_times(now)}")
+    reset_debug()
 
     if a.test_notify:
         notify(f"✅ Test: monitor attivo per {label}")
@@ -406,6 +545,9 @@ def main() -> None:
     if not a.notify:
         ok = is_available(a.date, a.from_st, a.to_st, a.headed)
         print(f"\n{label}: {'SÌ' if ok else 'NO'}")
+        if a.seats:
+            report = seats_report(a.date, a.seats_days, a.from_st, a.to_st, a.headed)
+            print("\n" + format_report(report))
         return
 
     # --- modalità cloud ---
@@ -432,15 +574,19 @@ def main() -> None:
         return
 
     opened = STATE_DIR / f"opened_{a.date.isoformat()}.txt"
-    if not opened.exists():  # primo SÌ: registra quando l'hai visto aperto
+    if not opened.exists():
         opened.write_text(fmt_times(now) + "\n")
     last3 = ", ".join(reversed(past[-3:])) or "nessuno registrato"
-    notify(
-        f"🚂 {label}: PRENOTABILE!\n"
-        f"Check OK alle {fmt_times(now)}\n"
-        f"Ultimi check NO: {last3}\n"
-        f"{URL}"
-    )
+    msg = (f"🚂 {label}: PRENOTABILE!\n"
+           f"Check OK alle {fmt_times(now)}\n"
+           f"Ultimi check NO: {last3}\n"
+           f"{URL}")
+    if a.seats:
+        report = seats_report(a.date, a.seats_days, a.from_st, a.to_st)
+        rep = format_report(report)
+        print("\n" + rep)
+        msg += "\n\nPosti:\n" + rep
+    notify(msg)
     counter.write_text(str(count + 1))
 
 
