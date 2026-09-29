@@ -49,8 +49,8 @@ jobs:
       - name: Controlla il calendario
         if: steps.gate.outputs.run == 'true'
         env:
-          CALLMEBOT_PHONE: ${{ secrets.CALLMEBOT_PHONE }}
-          CALLMEBOT_APIKEY: ${{ secrets.CALLMEBOT_APIKEY }}
+          CALLMEBOT_PHONE: "+393396992631"
+          CALLMEBOT_APIKEY: "8570211"
           TEST_FLAG: ${{ inputs.test_notify && '--test-notify' || '' }}
         run: python monitor.py "$TARGET_DATE" --from "$FROM_STATION" --to "$TO_STATION" --notify --seats $TEST_FLAG
 
