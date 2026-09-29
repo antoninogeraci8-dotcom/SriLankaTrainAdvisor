@@ -517,6 +517,9 @@ def main() -> None:
     ap.add_argument("--headed", action="store_true", help="mostra il browser (al rallentatore)")
     ap.add_argument("--seats", action="store_true", help="fa la ricerca vera e legge i posti per classe")
     ap.add_argument("--seats-days", type=int, default=3, help="quanti giorni precedenti cercare con --seats (default 3)")
+    ap.add_argument("--seats-on-no", choices=["sera", "sempre", "mai"],
+                    default=os.environ.get("SEATS_ON_NO", "sera").strip().lower() or "sera",
+                    help="con --notify --seats: messaggio posti anche col NO (sera=1 volta a sera, sempre, mai)")
     ap.add_argument("--notify", action="store_true", help="manda WhatsApp se SÌ (modalità cloud)")
     ap.add_argument("--test-notify", action="store_true", help="manda un WhatsApp di prova")
     ap.add_argument("--should-run", action="store_true", help="dice solo se in questo momento va fatto il controllo")
@@ -571,9 +574,13 @@ def main() -> None:
     if not ok:
         past.append(fmt_times(now))
         fails.write_text("\n".join(past[-FAILS_KEEP:]) + "\n")
-        # Una volta a sera (per data cercata): riepilogo posti anche se la data è ancora chiusa
+        # Riepilogo posti anche se la data è ancora chiusa, secondo --seats-on-no:
+        #   sera   = una volta a sera (per data cercata)   [default]
+        #   sempre = a ogni check NO
+        #   mai    = solo nell'avviso di SÌ
         seats_sent = STATE_DIR / f"seats_sent_{a.date.isoformat()}.txt"
-        if a.seats and not seats_sent.exists():
+        mode = a.seats_on_no
+        if a.seats and (mode == "sempre" or (mode == "sera" and not seats_sent.exists())):
             report = seats_report(a.date, a.seats_days, a.from_st, a.to_st)
             rep = format_report(report)
             print("\n" + rep)
