@@ -131,9 +131,13 @@ DAY_JS = "(day) => {" + JS_LIB + r"""
 
 
 # ---------- utilità ----------
-def auto_target(now_it: dt.datetime) -> dt.date:
-    """Domani (ora italiana) + 30 giorni. Es. 26/09 -> 27/10."""
-    return now_it.date() + dt.timedelta(days=1 + OPEN_DAYS_BEFORE)
+def auto_target(now: dt.datetime) -> dt.date:
+    """La prossima data che si sblocca (o quella appena sbloccata) alla mezzanotte SL.
+    Cambia a mezzogiorno SL (8:30 IT legale / 7:30 IT solare), così resta la stessa
+    per tutta la sera, anche a cavallo della mezzanotte italiana.
+    Es. 26/09 pomeriggio o sera -> 27/10."""
+    base = (now.astimezone(SL_TZ) - dt.timedelta(hours=12)).date()
+    return base + dt.timedelta(days=1 + OPEN_DAYS_BEFORE)
 
 
 def parse_date(s: str) -> dt.date:
@@ -348,7 +352,7 @@ def should_run(target: dt.date, now: dt.datetime) -> tuple[bool, str]:
         start, end = parse_window(window)
         it = now.astimezone(IT_TZ)
         m = it.hour * 60 + it.minute
-        inside = start <= m < end
+        inside = (start <= m < end) if start < end else (m >= start or m < end)  # anche a cavallo di mezzanotte
         return inside, f"finestra IT {window}: ora {it:%H:%M} {'dentro' if inside else 'fuori'}"
 
     # Pianificazione automatica (ora Sri Lanka)
