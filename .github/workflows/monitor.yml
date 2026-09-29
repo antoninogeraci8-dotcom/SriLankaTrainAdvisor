@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
-      TARGET_DATE: "auto" # auto = domani + 30 giorni (ora italiana); oppure una data fissa AAAA-MM-GG
+      TARGET_DATE: "2026-09-29" # auto = domani + 30 giorni (ora italiana); oppure una data fissa AAAA-MM-GG
       CHECK_WINDOW_IT: "18:00-24:00" # controlla a ogni run in questa fascia (ora italiana); vuoto = pianificazione automatica
       FROM_STATION: ${{ vars.FROM_STATION || 'Nanu Oya' }}
       TO_STATION: ${{ vars.TO_STATION || 'Ella' }}
